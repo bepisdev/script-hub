@@ -31,7 +31,7 @@ pub(super) fn render_title_bar(f: &mut Frame, area: Rect) {
         Span::styled("  v0.1.0", Style::default().fg(DOS_DARK_GRAY)),
         Span::raw("          "),
         Span::styled(
-            "[ Automation Script Launcher ]",
+            "",
             Style::default().fg(DOS_CYAN),
         ),
     ]))
