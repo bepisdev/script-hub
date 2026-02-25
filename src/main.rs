@@ -1,4 +1,8 @@
-use std::io;
+use std::{
+    fs,
+    io,
+    path::{Path, PathBuf},
+};
 
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
@@ -22,14 +26,16 @@ const DOS_WHITE: Color = Color::White;
 const DOS_BLACK: Color = Color::Black;
 const DOS_DARK_GRAY: Color = Color::DarkGray;
 const DOS_GREEN: Color = Color::Green;
+const DOS_RED: Color = Color::Red;
 
 // ── Data model ────────────────────────────────────────────────────────────────
 #[derive(Clone)]
 struct ScriptEntry {
-    name: &'static str,
-    description: &'static str,
-    category: &'static str,
-    command: &'static str,
+    name: String,
+    description: String,
+    category: String,
+    /// Absolute path to the script file on disk
+    path: PathBuf,
 }
 
 struct App {
@@ -38,74 +44,33 @@ struct App {
     list_state: ListState,
     show_run_dialog: bool,
     last_message: Option<String>,
+    /// Non-fatal warnings accumulated while loading scripts
+    load_warnings: Vec<String>,
+    /// The directory that was scanned
+    scripts_dir: PathBuf,
 }
 
 impl App {
-    fn new() -> Self {
-        let scripts = vec![
-            ScriptEntry {
-                name: "Backup Home",
-                description: "Backs up the home directory to NAS storage.",
-                category: "System",
-                command: "backup_home.sh",
-            },
-            ScriptEntry {
-                name: "Clean Temp Files",
-                description: "Removes temporary files, caches and build artefacts.",
-                category: "System",
-                command: "clean_temp.sh",
-            },
-            ScriptEntry {
-                name: "Update Dependencies",
-                description: "Updates all project package dependencies to latest.",
-                category: "Development",
-                command: "update_deps.sh",
-            },
-            ScriptEntry {
-                name: "Deploy to Staging",
-                description: "Builds and deploys the current branch to the staging environment.",
-                category: "Development",
-                command: "deploy_staging.sh",
-            },
-            ScriptEntry {
-                name: "DB Snapshot",
-                description: "Takes a point-in-time snapshot of the production database.",
-                category: "Database",
-                command: "db_snapshot.sh",
-            },
-            ScriptEntry {
-                name: "DB Restore",
-                description: "Restores a previously taken database snapshot.",
-                category: "Database",
-                command: "db_restore.sh",
-            },
-            ScriptEntry {
-                name: "Health Check",
-                description: "Runs health checks across all registered services.",
-                category: "Monitoring",
-                command: "health_check.sh",
-            },
-            ScriptEntry {
-                name: "Log Analyzer",
-                description: "Parses and summarises recent application log files.",
-                category: "Monitoring",
-                command: "analyze_logs.sh",
-            },
-        ];
-
+    fn new(scripts: Vec<ScriptEntry>, load_warnings: Vec<String>, scripts_dir: PathBuf) -> Self {
         let mut list_state = ListState::default();
-        list_state.select(Some(0));
-
+        if !scripts.is_empty() {
+            list_state.select(Some(0));
+        }
         App {
             scripts,
             list_state,
             show_run_dialog: false,
             last_message: None,
+            load_warnings,
+            scripts_dir,
         }
     }
 
     fn next(&mut self) {
         let len = self.scripts.len();
+        if len == 0 {
+            return;
+        }
         let i = self
             .list_state
             .selected()
@@ -116,6 +81,9 @@ impl App {
 
     fn previous(&mut self) {
         let len = self.scripts.len();
+        if len == 0 {
+            return;
+        }
         let i = self
             .list_state
             .selected()
@@ -129,15 +97,125 @@ impl App {
     }
 }
 
+// ── Script discovery ──────────────────────────────────────────────────────────
+
+/// Resolve the `scripts.d` directory.  Searches:
+///   1. Next to the running binary
+///   2. Current working directory
+fn find_scripts_dir() -> PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        let candidate = exe
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join("scripts.d");
+        if candidate.is_dir() {
+            return candidate;
+        }
+    }
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("scripts.d")
+}
+
+/// Extract metadata tags from a script file's header comments.
+///
+/// Recognised tags (anywhere in the first 40 lines):
+/// ```
+/// # @name:        My Script
+/// # @description: What it does
+/// # @category:    Category Name
+/// ```
+///
+/// Returns `None` if `@name` is absent (required).
+fn parse_script_metadata(path: &Path) -> Result<ScriptEntry, String> {
+    let content = fs::read_to_string(path)
+        .map_err(|e| format!("{}: {}", path.display(), e))?;
+
+    let mut name: Option<String> = None;
+    let mut description = String::new();
+    let mut category = String::from("Uncategorized");
+
+    for line in content.lines().take(40) {
+        let line = line.trim();
+        if let Some(val) = line.strip_prefix("# @name:") {
+            name = Some(val.trim().to_string());
+        } else if let Some(val) = line.strip_prefix("# @description:") {
+            description = val.trim().to_string();
+        } else if let Some(val) = line.strip_prefix("# @category:") {
+            category = val.trim().to_string();
+        }
+    }
+
+    let name = name.ok_or_else(|| {
+        format!(
+            "{}: missing required tag `# @name:`",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        )
+    })?;
+
+    Ok(ScriptEntry {
+        name,
+        description,
+        category,
+        path: path.to_path_buf(),
+    })
+}
+
+/// Load all scripts from `scripts_dir`, returning the list and any
+/// non-fatal warnings (e.g. files that were skipped due to missing tags).
+fn load_scripts(scripts_dir: &Path) -> (Vec<ScriptEntry>, Vec<String>) {
+    let mut scripts: Vec<ScriptEntry> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+
+    let read_dir = match fs::read_dir(scripts_dir) {
+        Ok(rd) => rd,
+        Err(e) => {
+            warnings.push(format!(
+                "Cannot open {}: {}",
+                scripts_dir.display(),
+                e
+            ));
+            return (scripts, warnings);
+        }
+    };
+
+    let mut paths: Vec<PathBuf> = read_dir
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_file())
+        .collect();
+    paths.sort();
+
+    for path in &paths {
+        match parse_script_metadata(path) {
+            Ok(entry) => scripts.push(entry),
+            Err(msg) => warnings.push(format!("Skipped — {msg}")),
+        }
+    }
+
+    // Sort by category, then by name (case-insensitive)
+    scripts.sort_by(|a, b| {
+        a.category
+            .to_lowercase()
+            .cmp(&b.category.to_lowercase())
+            .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+
+    (scripts, warnings)
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 fn main() -> io::Result<()> {
+    let scripts_dir = find_scripts_dir();
+    let (scripts, load_warnings) = load_scripts(&scripts_dir);
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new();
+    let mut app = App::new(scripts, load_warnings, scripts_dir);
     let result = run_app(&mut terminal, &mut app);
 
     // Always restore the terminal, even on error
@@ -172,8 +250,13 @@ fn run_app<B: ratatui::backend::Backend>(
                 match key.code {
                     KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
                         if let Some(script) = app.selected_script() {
-                            app.last_message =
-                                Some(format!("Launched: {}", script.command));
+                            let filename = script
+                                .path
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .into_owned();
+                            app.last_message = Some(format!("Launched: {filename}"));
                         }
                         app.show_run_dialog = false;
                     }
@@ -285,9 +368,11 @@ fn render_content(f: &mut Frame, app: &mut App, area: Rect) {
 
 // ── Script list panel ────────────────────────────────────────────────────────
 fn render_script_list(f: &mut Frame, app: &mut App, area: Rect) {
+    let script_count = app.scripts.len();
+    let title_text = format!(" Scripts ({script_count}) ");
     let block = Block::default()
         .title(Span::styled(
-            " Scripts ",
+            title_text,
             Style::default()
                 .fg(DOS_YELLOW)
                 .add_modifier(Modifier::BOLD),
@@ -297,15 +382,33 @@ fn render_script_list(f: &mut Frame, app: &mut App, area: Rect) {
         .border_style(Style::default().fg(DOS_CYAN).bg(DOS_BLUE))
         .style(Style::default().bg(DOS_BLUE));
 
+    if app.scripts.is_empty() {
+        let msg = Paragraph::new(vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  No scripts found.",
+                Style::default().fg(DOS_DARK_GRAY),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  Add scripts to scripts.d/",
+                Style::default().fg(DOS_WHITE),
+            )),
+        ])
+        .block(block);
+        f.render_widget(msg, area);
+        return;
+    }
+
     // Build rendered items, inserting category headers between groups.
     // We also build a mapping: script_index → rendered_row_index.
     let mut rendered: Vec<ListItem> = Vec::new();
     let mut script_to_row: Vec<usize> = Vec::new();
-    let mut current_category = "";
+    let mut current_category = String::new();
 
     for script in &app.scripts {
         if script.category != current_category {
-            current_category = script.category;
+            current_category = script.category.clone();
             rendered.push(ListItem::new(Line::from(vec![Span::styled(
                 format!(" ── {} ", script.category),
                 Style::default()
@@ -356,12 +459,20 @@ fn render_detail_panel(f: &mut Frame, app: &App, area: Rect) {
         .style(Style::default().bg(DOS_BLUE));
 
     let content = if let Some(script) = app.selected_script() {
-        Text::from(vec![
+        let filename = script
+            .path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let full_path = script.path.display().to_string();
+
+        let mut lines = vec![
             Line::from(""),
             Line::from(vec![
                 Span::styled("  Name     : ", Style::default().fg(DOS_DARK_GRAY)),
                 Span::styled(
-                    script.name,
+                    script.name.clone(),
                     Style::default()
                         .fg(DOS_YELLOW)
                         .add_modifier(Modifier::BOLD),
@@ -370,12 +481,16 @@ fn render_detail_panel(f: &mut Frame, app: &App, area: Rect) {
             Line::from(""),
             Line::from(vec![
                 Span::styled("  Category : ", Style::default().fg(DOS_DARK_GRAY)),
-                Span::styled(script.category, Style::default().fg(DOS_CYAN)),
+                Span::styled(script.category.clone(), Style::default().fg(DOS_CYAN)),
             ]),
             Line::from(""),
             Line::from(vec![
-                Span::styled("  Command  : ", Style::default().fg(DOS_DARK_GRAY)),
-                Span::styled(script.command, Style::default().fg(DOS_WHITE)),
+                Span::styled("  File     : ", Style::default().fg(DOS_DARK_GRAY)),
+                Span::styled(filename, Style::default().fg(DOS_WHITE)),
+            ]),
+            Line::from(vec![
+                Span::styled("  Path     : ", Style::default().fg(DOS_DARK_GRAY)),
+                Span::styled(full_path, Style::default().fg(DOS_DARK_GRAY)),
             ]),
             Line::from(""),
             Line::from(Span::styled(
@@ -385,11 +500,81 @@ fn render_detail_panel(f: &mut Frame, app: &App, area: Rect) {
             Line::from(""),
             Line::from(vec![
                 Span::raw("  "),
-                Span::styled(script.description, Style::default().fg(DOS_WHITE)),
+                Span::styled(script.description.clone(), Style::default().fg(DOS_WHITE)),
             ]),
-        ])
+        ];
+
+        // Show load warnings at the bottom of the detail pane
+        if !app.load_warnings.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  ─── Load warnings ───────────────────────",
+                Style::default().fg(DOS_DARK_GRAY),
+            )));
+            for w in &app.load_warnings {
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(w.clone(), Style::default().fg(DOS_RED)),
+                ]));
+            }
+        }
+
+        Text::from(lines)
     } else {
-        Text::from("")
+        // No scripts loaded — show helpful info
+        let dir = app.scripts_dir.display().to_string();
+        let mut lines = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  No scripts found.",
+                Style::default().fg(DOS_YELLOW).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  Place executable scripts in:",
+                Style::default().fg(DOS_WHITE),
+            )),
+            Line::from(vec![
+                Span::raw("    "),
+                Span::styled(dir, Style::default().fg(DOS_CYAN)),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  Each script must contain these header",
+                Style::default().fg(DOS_DARK_GRAY),
+            )),
+            Line::from(Span::styled(
+                "  comment tags (first 40 lines):",
+                Style::default().fg(DOS_DARK_GRAY),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "    # @name:        My Script",
+                Style::default().fg(DOS_GREEN),
+            )),
+            Line::from(Span::styled(
+                "    # @description: What it does",
+                Style::default().fg(DOS_GREEN),
+            )),
+            Line::from(Span::styled(
+                "    # @category:    Category",
+                Style::default().fg(DOS_GREEN),
+            )),
+        ];
+        if !app.load_warnings.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  ─── Load warnings ───────────────────────",
+                Style::default().fg(DOS_DARK_GRAY),
+            )));
+            for w in &app.load_warnings {
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(w.clone(), Style::default().fg(DOS_RED)),
+                ]));
+            }
+        }
+        Text::from(lines)
     };
 
     f.render_widget(
@@ -452,8 +637,8 @@ fn render_run_dialog(f: &mut Frame, app: &App, area: Rect) {
         return;
     };
 
-    let w: u16 = 52;
-    let h: u16 = 9;
+    let w: u16 = 58;
+    let h: u16 = 11;
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
     let dialog_area = Rect::new(x, y, w.min(area.width), h.min(area.height));
@@ -472,12 +657,19 @@ fn render_run_dialog(f: &mut Frame, app: &App, area: Rect) {
         .border_style(Style::default().fg(DOS_WHITE).bg(DOS_BLACK))
         .style(Style::default().bg(DOS_BLACK));
 
+    let filename = script
+        .path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+
     let content = Text::from(vec![
         Line::from(""),
         Line::from(vec![
-            Span::styled("  Script  : ", Style::default().fg(DOS_DARK_GRAY)),
+            Span::styled("  Script   : ", Style::default().fg(DOS_DARK_GRAY)),
             Span::styled(
-                script.name,
+                script.name.clone(),
                 Style::default()
                     .fg(DOS_YELLOW)
                     .add_modifier(Modifier::BOLD),
@@ -485,8 +677,13 @@ fn render_run_dialog(f: &mut Frame, app: &App, area: Rect) {
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled("  Command : ", Style::default().fg(DOS_DARK_GRAY)),
-            Span::styled(script.command, Style::default().fg(DOS_CYAN)),
+            Span::styled("  Category : ", Style::default().fg(DOS_DARK_GRAY)),
+            Span::styled(script.category.clone(), Style::default().fg(DOS_CYAN)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  File     : ", Style::default().fg(DOS_DARK_GRAY)),
+            Span::styled(filename, Style::default().fg(DOS_WHITE)),
         ]),
         Line::from(""),
         Line::from(Span::styled(
