@@ -1,3 +1,4 @@
+mod arg_form;
 mod detail_panel;
 mod run_dialog;
 mod script_list;
@@ -11,7 +12,10 @@ use ratatui::{
     Frame,
 };
 
-use crate::{app::App, theme::DOS_BLUE};
+use crate::{
+    app::{App, DialogState},
+    theme::DOS_BLUE,
+};
 
 /// Top-level UI entry point — called every frame.
 pub fn ui(f: &mut Frame, app: &mut App) {
@@ -36,8 +40,10 @@ pub fn ui(f: &mut Frame, app: &mut App) {
     render_content(f, app, chunks[1]);
     status_bar::render_status_bar(f, app, chunks[2]);
 
-    if app.show_run_dialog {
-        run_dialog::render_run_dialog(f, app, size);
+    match &app.dialog {
+        DialogState::Confirm => run_dialog::render_run_dialog(f, app, size),
+        DialogState::ArgsForm { .. } => arg_form::render_arg_form(f, app, size),
+        DialogState::None => {}
     }
 }
 

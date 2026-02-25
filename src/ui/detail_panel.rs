@@ -70,6 +70,32 @@ pub(super) fn render_detail_panel(f: &mut Frame, app: &App, area: Rect) {
             ]),
         ];
 
+        // ── Declared arguments ────────────────────────────────────────────
+        if !script.args.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  ─────────────────────────────────────────",
+                Style::default().fg(DOS_DARK_GRAY),
+            )));
+            for arg in &script.args {
+                let req = if arg.required { " *" } else { "  " };
+                let default_hint = if arg.default.is_empty() {
+                    String::new()
+                } else {
+                    format!("  (default: {})", arg.default)
+                };
+                lines.push(Line::from(vec![
+                    Span::styled("  ", Style::default()),
+                    Span::styled(
+                        format!("{:<20}", arg.label),
+                        Style::default().fg(DOS_CYAN),
+                    ),
+                    Span::styled(req, Style::default().fg(DOS_RED)),
+                    Span::styled(default_hint, Style::default().fg(DOS_DARK_GRAY)),
+                ]));
+            }
+        }
+
         append_warnings(&mut lines, &app.load_warnings);
         Text::from(lines)
     } else {

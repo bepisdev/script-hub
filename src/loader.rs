@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::app::ScriptEntry;
+use crate::app::{ScriptArg, ScriptEntry};
 
 /// Resolve the `scripts.d` directory.  Searches:
 ///   1. Next to the running binary
@@ -25,12 +25,19 @@ pub fn find_scripts_dir() -> PathBuf {
 
 /// Extract metadata tags from a script file's header comments.
 ///
-/// Recognised tags (anywhere in the first 40 lines):
+/// Recognised tags (anywhere in the first 60 lines):
 /// ```text
 /// # @name:        My Script
 /// # @description: What it does
 /// # @category:    Category Name
+/// # @arg: var_name | Human Label | required | default_value
 /// ```
+///
+/// `@arg` format (pipe-separated, trailing fields optional):
+/// - field 1: variable name  (no spaces, used as env var / positional)
+/// - field 2: label          (shown in the form)
+/// - field 3: `required` or `optional` (default: optional)
+/// - field 4: default value  (default: empty)
 ///
 /// Returns an error string if `@name` is absent (required).
 fn parse_script_metadata(path: &Path) -> Result<ScriptEntry, String> {
@@ -39,8 +46,9 @@ fn parse_script_metadata(path: &Path) -> Result<ScriptEntry, String> {
     let mut name: Option<String> = None;
     let mut description = String::new();
     let mut category = String::from("Uncategorized");
+    let mut args: Vec<ScriptArg> = Vec::new();
 
-    for line in content.lines().take(40) {
+    for line in content.lines().take(60) {
         let line = line.trim();
         if let Some(val) = line.strip_prefix("# @name:") {
             name = Some(val.trim().to_string());
@@ -48,6 +56,10 @@ fn parse_script_metadata(path: &Path) -> Result<ScriptEntry, String> {
             description = val.trim().to_string();
         } else if let Some(val) = line.strip_prefix("# @category:") {
             category = val.trim().to_string();
+        } else if let Some(val) = line.strip_prefix("# @arg:") {
+            if let Some(arg) = parse_arg_tag(val) {
+                args.push(arg);
+            }
         }
     }
 
@@ -63,6 +75,30 @@ fn parse_script_metadata(path: &Path) -> Result<ScriptEntry, String> {
         description,
         category,
         path: path.to_path_buf(),
+        args,
+    })
+}
+
+/// Parse a single `@arg:` value string.
+///
+/// Format: `var_name | Human Label | required | default_value`
+/// Returns `None` if the name or label field is missing/empty.
+fn parse_arg_tag(raw: &str) -> Option<ScriptArg> {
+    let mut parts = raw.splitn(4, '|').map(str::trim);
+
+    let name = parts.next().filter(|s| !s.is_empty())?.to_string();
+    let label = parts.next().filter(|s| !s.is_empty())?.to_string();
+    let required = parts
+        .next()
+        .map(|s| s.eq_ignore_ascii_case("required"))
+        .unwrap_or(false);
+    let default = parts.next().unwrap_or("").to_string();
+
+    Some(ScriptArg {
+        name,
+        label,
+        required,
+        default,
     })
 }
 
